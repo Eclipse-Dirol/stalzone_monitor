@@ -2,7 +2,9 @@ from scapi import AppClient, OAuthClient
 import time
 import logging
 import json
+from pathlib import Path
 
+CONFIG_PATH = Path(__file__).resolve().parent.parent / "config.json"
 class SCAPI:
     def __init__(self):
         self.client = None
@@ -11,7 +13,7 @@ class SCAPI:
 
     async def _authorize(self):
         if not self._is_token_ready:
-            with open('config.json', "r", encoding="utf-8") as f:
+            with open(CONFIG_PATH, "r", encoding="utf-8") as f:
                 config_data = json.load(f)
 
             client_id = config_data["client"]["CLIENT_ID"]
