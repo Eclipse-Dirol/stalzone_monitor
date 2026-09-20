@@ -1,17 +1,30 @@
 import asyncio
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from pydantic import BaseModel
-from api.stalzone_api import SCAPI  # Ваш измененный класс
+from api.stalzone_api import SCAPI
+import json
+from pathlib import Path
 
 app = FastAPI(title="Stalzone Monitor API")
 api = SCAPI() 
 
 class FrontendData(BaseModel):
     item_id: str
+    client_id: str
+    client_secret: str
 
-@app.post("/api/auction/search")
-async def search_auction(item: FrontendData):
-    lots = await api.auction(item_id=item.item_id)
+CONFIG_PATH = Path(__file__).resolve().parent.parent / "config.json"
+
+@app.post("/api/view_item")
+async def search_auction(payload: FrontendData):
+    with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+        config_data = json.load(f)
+    config_data["client"]["CLIENT_ID"] = payload.client_id
+    config_data["client"]["CLIENT_SECRET"] = payload.client_secret
+    with open(CONFIG_PATH, "w", encoding="utf-8") as f:
+        json.dump(config_data, f, ensure_ascii=False, indent=4)
+
+    lots = await api.auction(item_id=payload.item_id)
 
     if not lots:
         raise HTTPException(status_code=404, detail="Лоты не найдены")
