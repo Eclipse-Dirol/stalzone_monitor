@@ -6,17 +6,32 @@ import customtkinter as ctk
 _IMAGE_CACHE = {}
 
 def resource_path(relative_path: str) -> str:
-    """Для статических ассетов (иконки, дефолтная база)"""
+    """Возвращает абсолютный путь к ресурсу (работает и при разработке, и в PyInstaller build)"""
     try:
+        # Папка временных файлов PyInstaller
         base_path = sys._MEIPASS
-    except Exception:
+    except AttributeError:
+        # Обычный запуск из исходников .py
         base_path = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-    return os.path.join(base_path, relative_path)
+    
+    # 1. Сначала проверяем путь внутри сборки / корня проекта
+    target = os.path.join(base_path, relative_path)
+    if os.path.exists(target):
+        return target
+
+    # 2. Если файл лежит рядом с самим скомпилированным .exe файлом
+    exe_dir = os.path.dirname(sys.executable)
+    target_exe = os.path.join(exe_dir, relative_path)
+    if os.path.exists(target_exe):
+        return target_exe
+
+    return target
 
 def get_app_dir() -> str:
-    """Возвращает постоянную директорию программы на диске"""
     if getattr(sys, 'frozen', False):
+        # Если запущено скомпилированное приложение (.exe)
         return os.path.dirname(sys.executable)
+    # Если запущен исходный скрипт .py
     return os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 
 def load_item_icon(icon_name: str, size=(36, 36)):

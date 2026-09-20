@@ -15,35 +15,35 @@ class WebSocketManager:
         self.ws = None
         self.thread = None
         self.is_running = False
+        self.item_id = None
 
-    def start(self):
-        """Запуск цикла WebSocket в отдельном потоке-демоне"""
-        if self.is_running:
-            return
+    def start_for_item(self, item_id: str):
+        """Запуск цикла WebSocket строго под выбранный item_id"""
+        self.stop()
+        self.item_id = str(item_id)
         self.is_running = True
         self.thread = threading.Thread(target=self._run_loop, daemon=True)
         self.thread.start()
 
     def _run_loop(self):
-        while self.is_running:
-            try:
-                self.ws = websocket.WebSocketApp(
-                    self.url,
-                    on_open=self._on_open,
-                    on_message=self._on_message,
-                    on_error=self._on_error,
-                    on_close=self._on_close,
-                )
-                self.ws.run_forever(ping_interval=20, ping_timeout=10)
-            except Exception as e:
-                print(f"[WS /ws/auction] Ошибка соединения: {e}")
-
-            # Автоматическая пауза перед повторной попыткой подключения
-            if self.is_running:
-                time.sleep(3)
+        try:
+            self.ws = websocket.WebSocketApp(
+                self.url,
+                on_open=self._on_open,
+                on_message=self._on_message,
+                on_error=self._on_error,
+                on_close=self._on_close,
+            )
+            # Запуск соединения
+            self.ws.run_forever(ping_interval=20, ping_timeout=10)
+        except Exception as e:
+            print(f"[WS] Ошибка соединения: {e}")
 
     def _on_open(self, ws):
-        print("[WS] Успешное подключение к /ws/auction")
+        # Сервер друга сразу ждет payload с item_id: config_data["item_id"]
+        if self.item_id:
+            msg = json.dumps({"item_id": self.item_id})
+            ws.send(msg)
 
     def _on_message(self, ws, message):
         try:
@@ -58,16 +58,15 @@ class WebSocketManager:
         print(f"[WS] Ошибка: {error}")
 
     def _on_close(self, ws, close_status_code, close_msg):
-        print(f"[WS] Отключено от /ws/auction (код: {close_status_code})")
-
-    def send_event(self, event_type: str, data: dict = None):
-        """Отправка JSON данных на бэкенд в сокет аукциона"""
-        if self.ws and self.ws.sock and self.ws.sock.connected:
-            msg = json.dumps({"type": event_type, "data": data or {}})
-            self.ws.send(msg)
+        pass
 
     def stop(self):
-        """Остановка фонового цикла"""
+        """Полная остановка и закрытие сокета при выходе из предмета"""
         self.is_running = False
+        self.item_id = None
         if self.ws:
-            self.ws.close()
+            try:
+                self.ws.close()
+            except Exception:
+                pass
+            self.ws = None

@@ -78,7 +78,7 @@ class WelcomeView(ctk.CTkFrame):
                 response = requests.post(
                     f"{self.api_base_url}/api/start",
                     json={"client_id": cid, "client_secret": sec},
-                    timeout=5
+                    timeout=20
                 )
 
                 data = response.json()
