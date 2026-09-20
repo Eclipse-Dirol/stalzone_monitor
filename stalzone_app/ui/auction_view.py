@@ -1,11 +1,12 @@
 import os
 import json
+from datetime import datetime, timezone
 import customtkinter as ctk
-from core.utils import load_item_icon, resource_path, get_app_dir
-from core.config_manager import get_favorites, toggle_favorite, get_deleted_items, add_deleted_item
-from core.api_client import notify_backend_item_viewed
+from PIL import Image
 
-# Словарь для точного сопоставления названий на кнопках с базой данных
+from core.utils import get_app_dir
+from core.config_manager import get_deleted_items, add_deleted_item
+
 CATEGORY_MAPPING = {
     "Все": "Все",
     "★ Избранное": "★ Избранное",
@@ -17,27 +18,24 @@ CATEGORY_MAPPING = {
 }
 
 class AuctionView(ctk.CTkFrame):
-    def __init__(self, master, on_open_detail):
-        super().__init__(master, fg_color="transparent")
-        self.on_open_detail = on_open_detail
+    def __init__(self, master, ws_manager=None):
+        super().__init__(master, fg_color="#121417")
+        self.ws_manager = ws_manager
+        self.db_path = os.path.join(get_app_dir(), "items_data.json")
+        self.images_dir = os.path.join(get_app_dir(), "image")
 
-        self.db_path = resource_path("items_data.json")
+        self.current_category = "Все"
+        self.current_search = ""
+        self.current_selected_item = None
+        self.image_cache = {}
+
         self.items = self._load_database()
-        self.favorites_set = set(get_favorites())
-
-        self._rebuild_search_index()
-
-        self.selected_category = "Все"
-        self.filtered_items = self.items
-        self.batch_size = 25
-        self.current_loaded = 0
-
-        self.card_pool = []
-        self._search_timer = None
 
         self._build_ui()
+        self._filter_and_display_items()
 
     def _load_database(self):
+        """Загрузка базы данных с фильтрацией удалённых предметов и боеприпасов"""
         items = []
         if os.path.exists(self.db_path):
             try:
@@ -51,11 +49,10 @@ class AuctionView(ctk.CTkFrame):
 
         active_items = []
         for it in items:
-            # Пропускаем удалённые через крестик
-            if it.get("id") in deleted_set:
+            item_id = str(it.get("id"))
+            if item_id in deleted_set:
                 continue
 
-            # Исключаем категорию боеприпасов
             cat_lower = str(it.get("category", "")).lower()
             if any(kw in cat_lower for kw in ammo_keywords):
                 continue
@@ -64,304 +61,295 @@ class AuctionView(ctk.CTkFrame):
 
         return active_items
 
-    def _save_database(self):
-        try:
-            real_db_path = os.path.join(get_app_dir(), "items_data.json")
-            with open(real_db_path, "w", encoding="utf-8") as f:
-                json.dump(self.items, f, ensure_ascii=False, separators=(',', ':'))
-        except Exception:
-            pass
-
-    def _rebuild_search_index(self):
-        self.search_index = [
-            (it, str(it.get("name", "")).lower(), str(it.get("category", "Разное")).strip().lower())
-            for it in self.items
-        ]
-
     def _build_ui(self):
-        top_bar = ctk.CTkFrame(self, height=50, corner_radius=0)
-        top_bar.pack(fill="x")
+        # Верхняя панель управления (поиск и категории)
+        self.top_frame = ctk.CTkFrame(self, height=50, fg_color="#181a1f", corner_radius=0)
+        self.top_frame.pack(fill="x", side="top")
 
-        self.count_lbl = ctk.CTkLabel(
-            top_bar,
-            text=f"Торговая площадка ({len(self.items)} предм.)",
-            font=("Segoe UI", 16, "bold")
+        # Поле поиска
+        self.search_entry = ctk.CTkEntry(
+            self.top_frame,
+            placeholder_text="Поиск по названию...",
+            width=240,
+            height=34,
+            corner_radius=6
         )
-        self.count_lbl.pack(side="left", padx=20, pady=8)
+        self.search_entry.pack(side="left", padx=(15, 10), pady=8)
+        self.search_entry.bind("<KeyRelease>", self._on_search_changed)
 
-        # Категории
-        cats_bar = ctk.CTkFrame(self, fg_color="transparent")
-        cats_bar.pack(fill="x", padx=20, pady=(6, 2))
-
-        self.category_buttons = {}
+        # Категории (без боеприпасов)
         categories = ["Все", "★ Избранное", "Оружие", "Броня", "Артефакты", "Обвесы", "Разное"]
+        self.cat_buttons = []
 
         for cat in categories:
             btn = ctk.CTkButton(
-                cats_bar,
+                self.top_frame,
                 text=cat,
-                height=26,
-                width=38,
-                fg_color="#278191" if cat == "Все" else "#1f232b",
-                hover_color="#1e6572" if cat == "Все" else "#2c323d",
-                text_color="#ffffff" if cat == "Все" else "#aaaaaa",
-                font=("Segoe UI", 11, "bold" if cat in ["Все", "★ Избранное"] else "normal"),
-                command=lambda c=cat: self._on_select_category(c)
+                width=80,
+                height=32,
+                corner_radius=6,
+                fg_color="#232730" if cat != "Все" else "#278191",
+                hover_color="#1e6572",
+                command=lambda c=cat: self._set_category(c)
             )
-            btn.pack(side="left", padx=(0, 6))
-            self.category_buttons[cat] = btn
+            btn.pack(side="left", padx=3, pady=8)
+            self.cat_buttons.append(btn)
 
-        # Поиск
-        search_panel = ctk.CTkFrame(self, fg_color="transparent")
-        search_panel.pack(fill="x", padx=20, pady=(4, 6))
+        # Основной контейнер с разделением на каталог и лоты
+        self.content_panes = ctk.CTkFrame(self, fg_color="transparent")
+        self.content_panes.pack(fill="both", expand=True, padx=15, pady=10)
 
-        self.search_entry = ctk.CTkEntry(
-            search_panel,
-            placeholder_text="🔍 Поиск предмета по названию...",
-            height=34,
-            font=("Segoe UI", 12)
+        # Левая колонка: каталог предметов
+        self.left_pane = ctk.CTkFrame(self.content_panes, fg_color="#16181d", corner_radius=8)
+        self.left_pane.pack(side="left", fill="both", expand=True, padx=(0, 8))
+
+        self.items_scroll = ctk.CTkScrollableFrame(self.left_pane, fg_color="transparent")
+        self.items_scroll.pack(fill="both", expand=True, padx=5, pady=5)
+
+        # Правая колонка: текущие лоты выбранного предмета
+        self.right_pane = ctk.CTkFrame(self.content_panes, width=460, fg_color="#16181d", corner_radius=8)
+        self.right_pane.pack(side="right", fill="both", padx=(8, 0))
+        self.right_pane.pack_propagate(False)
+
+        # Заголовок лотов
+        self.lot_header = ctk.CTkFrame(self.right_pane, height=45, fg_color="transparent")
+        self.lot_header.pack(fill="x", padx=12, pady=(10, 5))
+
+        self.selected_item_lbl = ctk.CTkLabel(
+            self.lot_header,
+            text="Выберите предмет",
+            font=("Segoe UI", 15, "bold"),
+            anchor="w"
         )
-        self.search_entry.pack(fill="x")
-        self.search_entry.bind("<KeyRelease>", self._on_search_keypress)
+        self.selected_item_lbl.pack(side="left", fill="x", expand=True)
 
-        # Список карточек
-        self.scroll = ctk.CTkScrollableFrame(self, corner_radius=6)
-        self.scroll.pack(fill="both", expand=True, padx=20, pady=(2, 14))
-
-        self.empty_lbl = ctk.CTkLabel(
-            self.scroll,
-            text="Ничего не найдено",
-            text_color="#888888",
-            font=("Segoe UI", 14)
+        self.lots_status_lbl = ctk.CTkLabel(
+            self.lot_header,
+            text="",
+            font=("Segoe UI", 11),
+            text_color="#888888"
         )
+        self.lots_status_lbl.pack(side="right")
 
-        self.load_more_btn = ctk.CTkButton(
-            self.scroll,
-            text="Показать ещё",
-            height=32,
-            fg_color="#1f232b",
-            hover_color="#2c323d",
-            command=self._render_next_batch
-        )
+        # Контейнер для карточек лотов
+        self.lots_scroll_frame = ctk.CTkScrollableFrame(self.right_pane, fg_color="transparent")
+        self.lots_scroll_frame.pack(fill="both", expand=True, padx=8, pady=(0, 10))
 
-        self._filter_and_apply()
-
-    def _matches_category(self, item_cat_lower: str, selected_cat: str) -> bool:
-        if selected_cat == "Все":
-            return True
-        keywords = CATEGORY_MAPPING.get(selected_cat, [selected_cat.lower()])
-        return any(kw in item_cat_lower for kw in keywords)
-
-    def _on_select_category(self, category):
-        if self.selected_category == category:
-            return
-        self.selected_category = category
-        for name, btn in self.category_buttons.items():
-            if name == category:
-                btn.configure(fg_color="#278191", text_color="#ffffff", hover_color="#1e6572")
+    def _set_category(self, cat_name: str):
+        self.current_category = cat_name
+        for btn in self.cat_buttons:
+            if btn.cget("text") == cat_name:
+                btn.configure(fg_color="#278191")
             else:
-                btn.configure(fg_color="#1f232b", text_color="#aaaaaa", hover_color="#2c323d")
-        self._filter_and_apply()
+                btn.configure(fg_color="#232730")
+        self._filter_and_display_items()
 
-    def _on_search_keypress(self, event=None):
-        if self._search_timer is not None:
-            self.after_cancel(self._search_timer)
-        self._search_timer = self.after(180, self._filter_and_apply)
+    def _on_search_changed(self, event=None):
+        self.current_search = self.search_entry.get().strip().lower()
+        self._filter_and_display_items()
 
-    def _filter_and_apply(self):
-        query = self.search_entry.get().strip().lower()
-        cat = self.selected_category
+    def _filter_and_display_items(self):
+        for w in self.items_scroll.winfo_children():
+            w.destroy()
 
-        results = []
-        for item, name_lower, item_cat_lower in self.search_index:
-            if cat == "★ Избранное":
-                if item.get("id") not in self.favorites_set:
-                    continue
-            elif not self._matches_category(item_cat_lower, cat):
+        mapping = CATEGORY_MAPPING.get(self.current_category, "Все")
+
+        for it in self.items:
+            name = str(it.get("name", ""))
+            category = str(it.get("category", "")).lower()
+
+            if self.current_search and self.current_search not in name.lower():
                 continue
 
-            if query and query not in name_lower:
-                continue
+            if self.current_category != "Все":
+                if isinstance(mapping, list):
+                    if not any(sub in category for sub in mapping):
+                        continue
+                elif self.current_category == "★ Избранное":
+                    if not it.get("is_favorite", False):
+                        continue
 
-            results.append(item)
+            self._render_item_card(it)
 
-        self._reset_and_render(results)
+    def _render_item_card(self, it: dict):
+        card = ctk.CTkFrame(self.items_scroll, height=52, fg_color="#20242c", corner_radius=6)
+        card.pack(fill="x", pady=3, padx=2)
 
-    def _get_or_create_card(self, index):
-        if index < len(self.card_pool):
-            return self.card_pool[index]
+        # Загрузка иконки
+        icon_name = it.get("icon")
+        img_ctk = None
+        if icon_name:
+            if icon_name in self.image_cache:
+                img_ctk = self.image_cache[icon_name]
+            else:
+                img_path = os.path.join(self.images_dir, icon_name)
+                if os.path.exists(img_path):
+                    try:
+                        pil_img = Image.open(img_path)
+                        img_ctk = ctk.CTkImage(light_image=pil_img, dark_image=pil_img, size=(32, 32))
+                        self.image_cache[icon_name] = img_ctk
+                    except Exception:
+                        pass
 
-        card = ctk.CTkFrame(self.scroll, corner_radius=6, height=44)
+        if img_ctk:
+            img_lbl = ctk.CTkLabel(card, text="", image=img_ctk)
+            img_lbl.pack(side="left", padx=8)
 
-        fav_btn = ctk.CTkButton(
+        # Название предмета
+        name_lbl = ctk.CTkLabel(
             card,
-            text="★",
-            width=28,
-            height=28,
-            fg_color="transparent",
-            hover_color="#232731",
-            text_color="#4a5568",
-            font=("Segoe UI", 16, "bold")
+            text=it.get("name", "Без названия"),
+            font=("Segoe UI", 12, "bold"),
+            anchor="w"
         )
-        fav_btn.pack(side="left", padx=(6, 4), pady=4)
+        name_lbl.pack(side="left", fill="x", expand=True, padx=5)
 
-        icon_lbl = ctk.CTkLabel(card, text="", width=36)
-        icon_lbl.pack(side="left", padx=(0, 8), pady=4)
+        # Кнопка просмотра лотов
+        view_btn = ctk.CTkButton(
+            card,
+            text="Лоты",
+            width=65,
+            height=28,
+            font=("Segoe UI", 11, "bold"),
+            fg_color="#278191",
+            hover_color="#1e6572",
+            command=lambda item=it: self.on_select_item(item)
+        )
+        view_btn.pack(side="right", padx=6)
 
-        title_lbl = ctk.CTkLabel(card, text="", font=("Segoe UI", 12, "bold"), anchor="w")
-        title_lbl.pack(side="left", fill="x", expand=True, pady=4)
-
+        # Кнопка удаления (крестик)
         del_btn = ctk.CTkButton(
             card,
             text="✕",
             width=28,
             height=28,
             fg_color="transparent",
-            hover_color="#802b2b",
-            text_color="#777777",
-            font=("Segoe UI", 12, "bold")
+            text_color="#888888",
+            hover_color="#3a1c1c",
+            command=lambda item=it, c_widget=card: self._delete_item(item, c_widget)
         )
-        del_btn.pack(side="right", padx=(4, 8), pady=4)
+        del_btn.pack(side="right", padx=(0, 4))
 
-        btn = ctk.CTkButton(
-            card,
-            text="Просмотреть",
-            width=92,
-            height=28,
-            fg_color="#278191",
-            hover_color="#1e6572",
-            font=("Segoe UI", 11, "bold")
-        )
-        btn.pack(side="right", padx=(0, 4), pady=4)
-
-        card_data = {
-            "frame": card,
-            "fav_btn": fav_btn,
-            "icon_lbl": icon_lbl,
-            "title_lbl": title_lbl,
-            "btn": btn,
-            "del_btn": del_btn,
-            "current_item": None
-        }
-
-        fav_btn.configure(command=lambda c=card_data: self._on_card_star_clicked(c))
-        self.card_pool.append(card_data)
-        return card_data
-
-    def _delete_item(self, card, item):
-        if not item or not isinstance(item, dict):
-            return
-
-        item_id = item.get("id")
-        if not item_id:
-            return
-
-        # 1. Запоминаем в config.json
+    def _delete_item(self, item: dict, card_widget):
+        item_id = str(item.get("id"))
         add_deleted_item(item_id)
+        self.items = [i for i in self.items if str(i.get("id")) != item_id]
+        card_widget.destroy()
 
-        # 2. Удаляем из списков в оперативной памяти
-        self.items = [it for it in self.items if it.get("id") != item_id]
-        self.filtered_items = [it for it in self.filtered_items if it.get("id") != item_id]
-        self.favorites_set.discard(item_id)
-        self._rebuild_search_index()
-        self._save_database()
-
-        # 3. Мгновенно скрываем карточку прямо на экране (скролл не сбивается!)
-        if card and "frame" in card:
-            card["frame"].pack_forget()
-
-        # 4. Обновляем счётчики в шапке и на кнопке «Показать ещё»
-        self.count_lbl.configure(text=f"Торговая площадка ({len(self.items)} предм.)")
-        
-        if hasattr(self, 'load_more_btn'):
-            remains = len(self.filtered_items) - self.current_loaded
-            if remains > 0:
-                self.load_more_btn.configure(text=f"Показать ещё ({min(self.batch_size, remains)} из {remains})")
-            else:
-                self.load_more_btn.pack_forget()
-
-    def _reset_and_render(self, item_list):
-        try:
-            self.scroll._parent_canvas.yview_moveto(0.0)
-        except Exception:
-            pass
-        self.filtered_items = item_list
-        self.current_loaded = 0
-
-        self.load_more_btn.pack_forget()
-        self.empty_lbl.pack_forget()
-
-        for c in self.card_pool:
-            c["frame"].pack_forget()
-
-        if not self.filtered_items:
-            msg = "В избранном пока ничего нет" if self.selected_category == "★ Избранное" else "Ничего не найдено"
-            self.empty_lbl.configure(text=msg)
-            self.empty_lbl.pack(pady=40)
-            return
-
-        self._render_next_batch()
-
-    def _render_next_batch(self):
-        start = self.current_loaded
-        end = min(start + self.batch_size, len(self.filtered_items))
-        next_items = self.filtered_items[start:end]
-
-        if not next_items:
-            return
-
-        self.load_more_btn.pack_forget()
-
-        for i, item in enumerate(next_items):
-            idx = start + i
-            card = self._get_or_create_card(idx)
-            card["current_item"] = item
-
-            item_id = item.get("id", "")
-            img = load_item_icon(item.get("icon", ""), size=(32, 32))
-            if img:
-                card["icon_lbl"].configure(image=img, text="")
-                card["icon_lbl"].image = img
-            else:
-                card["icon_lbl"].configure(image="", text="📦")
-                card["icon_lbl"].image = None
-
-            card["title_lbl"].configure(text=f"{item.get('name', '')}  ·  {item.get('category', '')}")
-            
-            # Прямая привязка к текущему item без утечки замыканий
-            card["btn"].configure(command=lambda it=item: self._on_item_view_clicked(it))
-            card["del_btn"].configure(command=lambda c=card, it=item: self._delete_item(c, it))
-
-            is_fav = item_id in self.favorites_set
-            card["fav_btn"].configure(text_color="#f1c40f" if is_fav else "#4a5568")
-
-            card["frame"].pack(fill="x", pady=2, padx=4)
-
-        self.current_loaded = end
-
-        if self.current_loaded < len(self.filtered_items):
-            remains = len(self.filtered_items) - self.current_loaded
-            self.load_more_btn.configure(text=f"Показать ещё ({min(self.batch_size, remains)} из {remains})")
-            self.load_more_btn.pack(fill="x", pady=8, padx=20)
-
-    def _on_card_star_clicked(self, card_data):
-        item = card_data.get("current_item")
-        if not item:
-            return
+    def on_select_item(self, item: dict):
+        """Отправка подписки на получение лотов в WebSocket"""
+        self.current_selected_item = item
         item_id = item.get("id")
 
-        now_fav = toggle_favorite(item_id)
-        if now_fav:
-            self.favorites_set.add(item_id)
-            card_data["fav_btn"].configure(text_color="#f1c40f")
-        else:
-            self.favorites_set.discard(item_id)
-            card_data["fav_btn"].configure(text_color="#4a5568")
+        self.selected_item_lbl.configure(text=item.get("name", "Предмет"))
+        self._clear_lots_container()
+        self._set_lots_status("Загрузка актуальных лотов...", color="#3498db")
 
-        if self.selected_category == "★ Избранное":
-            self._filter_and_apply()
+        if self.ws_manager and item_id:
+            # Отправка события бэкенду
+            self.ws_manager.send_event("subscribe_item", {"item_id": item_id})
 
-    def _on_item_view_clicked(self, item: dict):
-        if item:
-            notify_backend_item_viewed(item.get("id"))
-            self.on_open_detail(item)
+    def update_real_lots(self, payload: dict):
+        """Обработка данных, поступивших от бэкенда через WebSocket"""
+        lots = payload.get("data", [])
+        self._clear_lots_container()
+
+        if not lots:
+            self._set_lots_status("Активных лотов нет", color="#e67e22")
+            return
+
+        current_id = self.current_selected_item.get("id") if self.current_selected_item else None
+        first_lot_id = lots[0].get("itemId")
+        if current_id and first_lot_id and current_id != first_lot_id:
+            return
+
+        self._set_lots_status(f"Найдено лотов: {len(lots)}", color="#2ecc71")
+
+        # Сортировка по цене выкупа
+        sorted_lots = sorted(
+            lots,
+            key=lambda x: (x.get("buyoutPrice") or float("inf"), x.get("startPrice") or 0)
+        )
+
+        for lot in sorted_lots:
+            self._render_single_lot_card(lot)
+
+    def _render_single_lot_card(self, lot: dict):
+        row = ctk.CTkFrame(self.lots_scroll_frame, height=48, corner_radius=6, fg_color="#20242c")
+        row.pack(fill="x", pady=3, padx=4)
+
+        amount = lot.get("amount", 1)
+        amt_text = f"x{amount}" if amount > 1 else "1 шт."
+        ctk.CTkLabel(
+            row,
+            text=amt_text,
+            width=50,
+            font=("Segoe UI", 12, "bold"),
+            text_color="#3498db"
+        ).pack(side="left", padx=(10, 5))
+
+        buyout = lot.get("buyoutPrice")
+        start = lot.get("startPrice")
+        cur_price = lot.get("currentPrice")
+
+        price_parts = []
+        if buyout and buyout > 0:
+            price_parts.append(f"Выкуп: {buyout:,} ₽".replace(",", " "))
+        if cur_price and cur_price > 0:
+            price_parts.append(f"Ставка: {cur_price:,} ₽".replace(",", " "))
+        elif start and start > 0:
+            price_parts.append(f"Старт: {start:,} ₽".replace(",", " "))
+
+        price_str = "   |   ".join(price_parts) if price_parts else "Цена не указана"
+
+        ctk.CTkLabel(
+            row,
+            text=price_str,
+            font=("Segoe UI", 13, "bold"),
+            text_color="#ffffff",
+            anchor="w"
+        ).pack(side="left", fill="x", expand=True, padx=10)
+
+        end_time_str = lot.get("endTime")
+        time_left_str = self._calculate_time_left(end_time_str)
+
+        ctk.CTkLabel(
+            row,
+            text=f"⏱ {time_left_str}",
+            font=("Segoe UI", 11),
+            text_color="#95a5a6"
+        ).pack(side="right", padx=12)
+
+    @staticmethod
+    def _calculate_time_left(end_time_str: str) -> str:
+        if not end_time_str:
+            return "—"
+        try:
+            clean_str = end_time_str.replace("Z", "+00:00")
+            end_dt = datetime.fromisoformat(clean_str)
+            now_dt = datetime.now(timezone.utc)
+
+            delta = end_dt - now_dt
+            total_seconds = int(delta.total_seconds())
+
+            if total_seconds <= 0:
+                return "Завершен"
+
+            days = total_seconds // 86400
+            hours = (total_seconds % 86400) // 3600
+            minutes = (total_seconds % 3600) // 60
+
+            if days > 0:
+                return f"{days} д {hours} ч"
+            if hours > 0:
+                return f"{hours} ч {minutes} мин"
+            return f"{minutes} мин"
+        except Exception:
+            return end_time_str[:10]
+
+    def _clear_lots_container(self):
+        for child in self.lots_scroll_frame.winfo_children():
+            child.destroy()
+
+    def _set_lots_status(self, text: str, color: str = "#888888"):
+        self.lots_status_lbl.configure(text=text, text_color=color)

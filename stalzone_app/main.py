@@ -7,88 +7,70 @@ from ui.auction_view import AuctionView
 from ui.detail_view import DetailView
 from core.api_client import init_backend_session
 from core.ws_client import WebSocketManager
+from core.config_manager import load_config
+
+ctk.set_appearance_mode("dark")
+ctk.set_default_color_theme("blue")
 
 class App(ctk.CTk):
     def __init__(self):
         super().__init__()
 
-        # Инициализация WS-клиента
+        self.title("Stalzone Auction Client")
+        self.geometry("1100x680")
+        self.minsize(960, 580)
+
+        # Менеджер WebSocket к роуту /ws/auction
         self.ws_manager = WebSocketManager(
             url="ws://127.0.0.1:8000/ws/auction",
-            on_message_callback=self._handle_raw_ws_message,
+            on_message_callback=self._handle_raw_ws_message
         )
 
-        # Корректное закрытие сокета при выходе из программы
+        self.current_view = None
         self.protocol("WM_DELETE_WINDOW", self._on_close_window)
 
-        self.title("Stalzone Auction")
-        self.geometry("1100, 700")
-        self.minsize(900, 600)
-        ctk.set_appearance_mode("dark")
+        # Выбор стартового экрана в зависимости от наличия сохранённых ключей
+        config = load_config()
+        if config.get("client_id") and config.get("client_secret"):
+            # Если ключи уже есть, сразу стартуем сокет и переходим к аукциону
+            self.on_login_success()
+        else:
+            self.show_welcome_view()
 
-        # Иконка окна
-        try:
-            ico_path = resource_path("app_icon.ico")
-            if os.path.exists(ico_path):
-                self.iconbitmap(ico_path)
-        except Exception:
-            pass
+    def show_welcome_view(self):
+        if self.current_view:
+            self.current_view.destroy()
 
-        # Инициализация экранов с защитой от тихого падения
-        try:
-            self.welcome_screen = WelcomeView(self, on_login_success=self.show_auction)
-            self.auction_screen = None
-            self.detail_screen = DetailView(self, on_back=self.show_auction)
+        self.current_view = WelcomeView(master=self, on_login_success=self.on_login_success)
+        self.current_view.pack(fill="both", expand=True)
 
-            # Однократная передача ключей бэкенду
-            init_backend_session()
+    def show_auction_view(self):
+        if self.current_view:
+            self.current_view.destroy()
 
-            self.show_welcome()
-        except Exception as e:
-            print(f"[FATAL ERROR] Ошибка запуска экранов: {e}")
-            traceback.print_exc()
-
-    def _hide_all(self):
-        if hasattr(self, 'welcome_screen') and self.welcome_screen:
-            self.welcome_screen.pack_forget()
-        if hasattr(self, 'auction_screen') and self.auction_screen:
-            self.auction_screen.pack_forget()
-        if hasattr(self, 'detail_screen') and self.detail_screen:
-            self.detail_screen.pack_forget()
-
-    def show_welcome(self):
-        self._hide_all()
-        self.welcome_screen.pack(fill="both", expand=True)
-
-    def show_auction(self):
-        self._hide_all()
-        try:
-            if self.auction_screen is None:
-                self.auction_screen = AuctionView(self, on_open_detail=self.show_detail)
-            self.auction_screen.pack(fill="both", expand=True)
-        except Exception as e:
-            print(f"[ERROR] Ошибка открытия AuctionView: {e}")
-            traceback.print_exc()
-
-    def show_detail(self, item):
-        self._hide_all()
-        self.detail_screen.show_item(item)
-        self.detail_screen.pack(fill="both", expand=True)
+        self.current_view = AuctionView(master=self, ws_manager=self.ws_manager)
+        self.current_view.pack(fill="both", expand=True)
 
     def on_login_success(self):
-        """Запускаем WebSocket только после успешного входа"""
+        """Успешный вход: подключаемся к сокету и открываем интерфейс аукциона"""
         self.ws_manager.start()
         self.show_auction_view()
 
     def _handle_raw_ws_message(self, payload):
-        # Безопасный перевод события из сетевого потока в главный поток GUI
-        self.after(0, lambda: self._process_auction_ws_event(payload))
+        """Перенос входящих сообщений из потока сокета в поток UI"""
+        self.after(0, lambda: self._process_ws_payload(payload))
 
-    def _process_ws_event(self, payload):
-        """Обработка входящих данных в основном потоке"""
-        print(f"[WS EVENT]: {payload}")
+    def _process_ws_payload(self, payload):
+        """Передача полученного списка лотов в AuctionView"""
+        if not isinstance(payload, dict):
+            return
+
+        if payload.get("status") == "success" and "data" in payload:
+            if isinstance(self.current_view, AuctionView):
+                self.current_view.update_real_lots(payload)
 
     def _on_close_window(self):
+        """Остановка фоновых потоков при закрытии окна"""
         self.ws_manager.stop()
         self.destroy()
 
