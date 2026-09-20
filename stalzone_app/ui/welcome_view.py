@@ -36,7 +36,7 @@ class WelcomeView(ctk.CTkFrame):
         if saved_config.get("client_secret"):
             self.client_secret_entry.insert(0, saved_config["client_secret"])
 
-        self.status_lbl = ctk.CTkLabel(self.center_box, text="", font=("Segoe UI", 11), text_color="#e74c3c")
+        self.status_lbl = ctk.CTkLabel(self.center_box, text="", font=("Segoe UI", 11), text_color="#e74c3c", wraplength=320)
         self.status_lbl.pack(pady=(0, 8))
 
         self.enter_btn = ctk.CTkButton(self.center_box, text="ВОЙТИ", font=("Segoe UI", 14, "bold"), width=320, height=44, corner_radius=8, command=self._handle_login, fg_color="#1f232b", text_color="#333333", hover_color="#2980b9")
@@ -67,18 +67,54 @@ class WelcomeView(ctk.CTkFrame):
             self.status_lbl.configure(text="Заполните оба поля!", text_color="#e74c3c")
             return
 
-        save_config(cid, sec)
         self.enter_btn.configure(state="disabled", text="АВТОРИЗАЦИЯ...")
         self.status_lbl.configure(text="Связь с сервером...", text_color="#3498db")
 
         def auth_worker():
+            success = False
+            err_text = "Не удалось подключиться к бэкенду"
+
             try:
-                requests.post(f"{self.api_base_url}/api/auth", json={"client_id": cid, "client_secret": sec}, timeout=3)
-            except Exception:
-                pass
-            self.after(0, self.on_login_success)
+                response = requests.post(
+                    f"{self.api_base_url}/api/start",
+                    json={"client_id": cid, "client_secret": sec},
+                    timeout=5
+                )
+
+                data = response.json()
+
+                if response.status_code == 200 and data.get("status") == "success":
+                    success = True
+                else:
+                    detail = data.get("detail", {})
+                    if isinstance(detail, dict):
+                        err_text = detail.get("error_description") or detail.get("error") or "Неверные данные"
+                    elif isinstance(detail, str):
+                        err_text = detail
+                    else:
+                        err_text = "Ошибка авторизации"
+
+            except requests.exceptions.ConnectionError:
+                err_text = "Ошибка(Сервер не отвечает)"
+            except Exception as e:
+                err_text = f"Ошибка: {e}"
+
+            # Возврат управления в интерфейс
+            self.after(0, lambda: self._on_auth_completed(success, err_text, cid, sec))
 
         threading.Thread(target=auth_worker, daemon=True).start()
+
+    def _on_auth_completed(self, success, err_text, cid, sec):
+        self.enter_btn.configure(state="normal", text="ВОЙТИ")
+
+        if not success:
+            self.status_lbl.configure(text=f"✕ {err_text}", text_color="#e74c3c")
+            return
+
+        # Данные верны: сохраняем и входим
+        self.status_lbl.configure(text="")
+        save_config(cid, sec)
+        self.on_login_success()
 
     def _start_fade_in(self):
         self.step = 0

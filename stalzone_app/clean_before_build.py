@@ -64,6 +64,22 @@ def clean_database_and_images():
                         pass
 
     print(f"[OK] Удалено неиспользуемых иконок: {deleted_images_count}")
+    ammo_keywords = ("боеприпас", "патрон", "снаряд", "ammo", "ammunition")
+
+    for item in items:
+        item_id = str(item.get("id"))
+        cat_lower = str(item.get("category", "")).lower()
+
+        # Пропускаем удалённые и любые боеприпасы
+        if item_id in deleted_ids:
+            continue
+        if any(kw in cat_lower for kw in ammo_keywords):
+            continue
+
+        active_items.append(item)
+        icon = item.get("icon")
+        if icon:
+            active_icons.add(icon.lower())
 
 if __name__ == "__main__":
     clean_database_and_images()

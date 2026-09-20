@@ -5,6 +5,17 @@ from core.utils import load_item_icon, resource_path, get_app_dir
 from core.config_manager import get_favorites, toggle_favorite, get_deleted_items, add_deleted_item
 from core.api_client import notify_backend_item_viewed
 
+# Словарь для точного сопоставления названий на кнопках с базой данных
+CATEGORY_MAPPING = {
+    "Все": "Все",
+    "★ Избранное": "★ Избранное",
+    "Оружие": ["оружие", "weapon"],
+    "Броня": ["броня", "костюмы", "armor"],
+    "Артефакты": ["артефакты", "артефакт", "artefact", "artefacts"],
+    "Обвесы": ["обвесы", "прицелы", "надульники", "цевья", "attachment", "attachments"],
+    "Разное": ["разное", "прочее", "other", "misc"]
+}
+
 class AuctionView(ctk.CTkFrame):
     def __init__(self, master, on_open_detail):
         super().__init__(master, fg_color="transparent")
@@ -18,12 +29,11 @@ class AuctionView(ctk.CTkFrame):
 
         self.selected_category = "Все"
         self.filtered_items = self.items
-        self.batch_size = 20
+        self.batch_size = 25
         self.current_loaded = 0
 
         self.card_pool = []
         self._search_timer = None
-        self._render_job = None
 
         self._build_ui()
 
@@ -33,10 +43,26 @@ class AuctionView(ctk.CTkFrame):
             try:
                 with open(self.db_path, "r", encoding="utf-8") as f:
                     items = json.load(f)
-            except Exception:
-                pass
+            except Exception as e:
+                print(f"[ERROR] Ошибка чтения items_data.json: {e}")
+
         deleted_set = set(get_deleted_items())
-        return [it for it in items if it.get("id") not in deleted_set]
+        ammo_keywords = ("боеприпас", "патрон", "снаряд", "ammo", "ammunition")
+
+        active_items = []
+        for it in items:
+            # Пропускаем удалённые через крестик
+            if it.get("id") in deleted_set:
+                continue
+
+            # Исключаем категорию боеприпасов
+            cat_lower = str(it.get("category", "")).lower()
+            if any(kw in cat_lower for kw in ammo_keywords):
+                continue
+
+            active_items.append(it)
+
+        return active_items
 
     def _save_database(self):
         try:
@@ -48,7 +74,7 @@ class AuctionView(ctk.CTkFrame):
 
     def _rebuild_search_index(self):
         self.search_index = [
-            (it, it.get("name", "").lower(), it.get("category", "Разное"))
+            (it, str(it.get("name", "")).lower(), str(it.get("category", "Разное")).strip().lower())
             for it in self.items
         ]
 
@@ -68,7 +94,7 @@ class AuctionView(ctk.CTkFrame):
         cats_bar.pack(fill="x", padx=20, pady=(6, 2))
 
         self.category_buttons = {}
-        categories = ["Все", "★ Избранное", "Оружие", "Броня", "Артефакты", "Обвесы", "Боеприпасы", "Разное"]
+        categories = ["Все", "★ Избранное", "Оружие", "Броня", "Артефакты", "Обвесы", "Разное"]
 
         for cat in categories:
             btn = ctk.CTkButton(
@@ -102,7 +128,12 @@ class AuctionView(ctk.CTkFrame):
         self.scroll = ctk.CTkScrollableFrame(self, corner_radius=6)
         self.scroll.pack(fill="both", expand=True, padx=20, pady=(2, 14))
 
-        self.empty_lbl = ctk.CTkLabel(self.scroll, text="Ничего не найдено", text_color="gray", font=("Segoe UI", 13))
+        self.empty_lbl = ctk.CTkLabel(
+            self.scroll,
+            text="Ничего не найдено",
+            text_color="#888888",
+            font=("Segoe UI", 14)
+        )
 
         self.load_more_btn = ctk.CTkButton(
             self.scroll,
@@ -114,6 +145,12 @@ class AuctionView(ctk.CTkFrame):
         )
 
         self._filter_and_apply()
+
+    def _matches_category(self, item_cat_lower: str, selected_cat: str) -> bool:
+        if selected_cat == "Все":
+            return True
+        keywords = CATEGORY_MAPPING.get(selected_cat, [selected_cat.lower()])
+        return any(kw in item_cat_lower for kw in keywords)
 
     def _on_select_category(self, category):
         if self.selected_category == category:
@@ -132,26 +169,21 @@ class AuctionView(ctk.CTkFrame):
         self._search_timer = self.after(180, self._filter_and_apply)
 
     def _filter_and_apply(self):
-        if self._render_job:
-            self.after_cancel(self._render_job)
-
         query = self.search_entry.get().strip().lower()
         cat = self.selected_category
 
         results = []
-        for item, name_lower, item_cat in self.search_index:
+        for item, name_lower, item_cat_lower in self.search_index:
             if cat == "★ Избранное":
                 if item.get("id") not in self.favorites_set:
                     continue
-            elif cat != "Все" and item_cat != cat:
+            elif not self._matches_category(item_cat_lower, cat):
                 continue
 
             if query and query not in name_lower:
                 continue
 
             results.append(item)
-            if query and len(results) >= 60:
-                break
 
         self._reset_and_render(results)
 
@@ -159,7 +191,6 @@ class AuctionView(ctk.CTkFrame):
         if index < len(self.card_pool):
             return self.card_pool[index]
 
-        # Облегченная структура: без вложенных frame-контейнеров
         card = ctk.CTkFrame(self.scroll, corner_radius=6, height=44)
 
         fav_btn = ctk.CTkButton(
@@ -214,26 +245,46 @@ class AuctionView(ctk.CTkFrame):
         }
 
         fav_btn.configure(command=lambda c=card_data: self._on_card_star_clicked(c))
-        del_btn.configure(command=lambda c=card_data: self._delete_item(c["current_item"]))
-
         self.card_pool.append(card_data)
         return card_data
 
-    def _delete_item(self, item):
-        if not item:
+    def _delete_item(self, card, item):
+        if not item or not isinstance(item, dict):
             return
+
         item_id = item.get("id")
+        if not item_id:
+            return
+
+        # 1. Запоминаем в config.json
         add_deleted_item(item_id)
 
+        # 2. Удаляем из списков в оперативной памяти
         self.items = [it for it in self.items if it.get("id") != item_id]
+        self.filtered_items = [it for it in self.filtered_items if it.get("id") != item_id]
         self.favorites_set.discard(item_id)
         self._rebuild_search_index()
         self._save_database()
 
+        # 3. Мгновенно скрываем карточку прямо на экране (скролл не сбивается!)
+        if card and "frame" in card:
+            card["frame"].pack_forget()
+
+        # 4. Обновляем счётчики в шапке и на кнопке «Показать ещё»
         self.count_lbl.configure(text=f"Торговая площадка ({len(self.items)} предм.)")
-        self._filter_and_apply()
+        
+        if hasattr(self, 'load_more_btn'):
+            remains = len(self.filtered_items) - self.current_loaded
+            if remains > 0:
+                self.load_more_btn.configure(text=f"Показать ещё ({min(self.batch_size, remains)} из {remains})")
+            else:
+                self.load_more_btn.pack_forget()
 
     def _reset_and_render(self, item_list):
+        try:
+            self.scroll._parent_canvas.yview_moveto(0.0)
+        except Exception:
+            pass
         self.filtered_items = item_list
         self.current_loaded = 0
 
@@ -276,7 +327,10 @@ class AuctionView(ctk.CTkFrame):
                 card["icon_lbl"].image = None
 
             card["title_lbl"].configure(text=f"{item.get('name', '')}  ·  {item.get('category', '')}")
+            
+            # Прямая привязка к текущему item без утечки замыканий
             card["btn"].configure(command=lambda it=item: self._on_item_view_clicked(it))
+            card["del_btn"].configure(command=lambda c=card, it=item: self._delete_item(c, it))
 
             is_fav = item_id in self.favorites_set
             card["fav_btn"].configure(text_color="#f1c40f" if is_fav else "#4a5568")
